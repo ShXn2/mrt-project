@@ -1,0 +1,8 @@
+/data.yaml
+/datasets
+/door_closed
+/door_open
+/README.dataset.txt
+/README.roboflow.txt
+/runs
+/yolov8n.pt
