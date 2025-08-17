@@ -1,76 +1,84 @@
-from ultralytics import YOLO
 import cv2
-import paho.mqtt.client as mqtt
+from ultralytics import YOLO
 import mysql.connector
+import paho.mqtt.client as mqtt
 from datetime import datetime
 
-# MQTT
-broker = "broker.hivemq.com"  # หรือ 'localhost' ถ้าใช้ Mosquitto
-client = mqtt.Client()
-client.connect(broker, 1883, 60)
+# === YOLO MODEL ===
+model = YOLO("yolov8n.pt")
+cap = cv2.VideoCapture("IMG_3583.mp4")
 
-# MySQL
+# === MySQL SETUP ===
 db = mysql.connector.connect(
-    host="localhost",
-    user="your_user",
-    password="your_password",
+    host="192.168.1.1",        # IP ของ MySQL server (เช่น "192.168.1.10")
+    user="user1",        # เปลี่ยนเป็น user ของ Shane
+    password="1234",# เปลี่ยนเป็น password
     database="people_counter"
 )
 cursor = db.cursor()
 
-# YOLO
-model = YOLO("yolov8n.pt")
-cap = cv2.VideoCapture("your_video.mp4")
+# === MQTT SETUP ===
+MQTT_BROKER = "localhost"    # ถ้าใช้ Mosquitto บน PC ตัวเอง ใช้ "localhost"
+MQTT_PORT = 1883
+MQTT_TOPIC_IN = "people/in"
 
-line_y = 760
+client = mqtt.Client()
+client.connect(MQTT_BROKER, MQTT_PORT, 60)
+
+# === COUNTER ===
 count_in = 0
-track_memory = {}
-counted_ids = set()
+line_y = 760
+prev_ids = {}
 
 while True:
     ret, frame = cap.read()
     if not ret:
         break
 
-    results = model.track(frame, persist=True, classes=[0], conf=0.4)
-    frame_copy = frame.copy()
-    cv2.line(frame_copy, (840, line_y), (1250, line_y), (0, 0, 255), 3)
+    results = model.track(frame, persist=True, classes=[0])  # detect เฉพาะคน (class 0)
 
     if results[0].boxes.id is not None:
-        ids = results[0].boxes.id.cpu().numpy()
-        boxes = results[0].boxes.xyxy.cpu().numpy()
+        for box, track_id in zip(results[0].boxes.xyxy, results[0].boxes.id):
+            x1, y1, x2, y2 = map(int, box)
+            track_id = int(track_id)
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
 
-        for track_id, box in zip(ids, boxes):
-            x1, y1, x2, y2 = box.astype(int)
-            cx = int((x1 + x2) / 2)
-            cy = int(y2)
+            # ตรวจสอบการข้ามเส้น
+            if track_id in prev_ids:
+                prev_y = prev_ids[track_id]
+                if prev_y < line_y and cy >= line_y:  # เดินลง (IN)
+                    count_in += 1
+                    now = datetime.now()
 
-            if track_id not in track_memory:
-                track_memory[track_id] = [cy]
-            else:
-                track_memory[track_id].append(cy)
-                if len(track_memory[track_id]) >= 2 and track_id not in counted_ids:
-                    dy = cy - track_memory[track_id][-2]
-                    if track_memory[track_id][-2] > line_y >= cy and dy < 0:
-                        count_in += 1
-                        counted_ids.add(track_id)
+                    # === Save to MySQL ===
+                    cursor.execute(
+                        "INSERT INTO people_log (direction, count, timestamp) VALUES (%s, %s, %s)",
+                        ("IN", count_in, now)
+                    )
+                    db.commit()
 
-                        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        cursor.execute("INSERT INTO people_log (direction, count, timestamp) VALUES (%s, %s, %s)",
-                                       ("IN", count_in, now))
-                        db.commit()
+                    # === Publish to MQTT ===
+                    client.publish(MQTT_TOPIC_IN, f"{count_in}")
 
-                        client.publish("people/in", f"{count_in}")
+            prev_ids[track_id] = cy
 
-    cv2.putText(frame_copy, f"IN: {count_in}", (50, 80),
-                cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 5)
+            # วาดกรอบ
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(frame, f"ID {track_id}", (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-    cv2.imshow("Counter", frame_copy)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    # วาดเส้นนับ
+    cv2.line(frame, (0, line_y), (frame.shape[1], line_y), (0, 0, 255), 2)
+
+    # แสดงจำนวน
+    cv2.putText(frame, f"IN: {count_in}", (50, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 0, 0), 3)
+
+    cv2.imshow("People Counter", frame)
+    if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
 cap.release()
 cv2.destroyAllWindows()
-client.disconnect()
-cursor.close()
 db.close()
+client.disconnect()
